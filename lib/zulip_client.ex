@@ -41,7 +41,10 @@ defmodule ZulipMcp.Client do
     narrow = Keyword.get(opts, :narrow, [])
 
     params = %{
-      "narrow" => narrow |> Enum.map(fn {op, val} -> %{"operator" => op, "operand" => val} end) |> JSON.encode!(),
+      "narrow" =>
+        narrow
+        |> Enum.map(fn {op, val} -> %{"operator" => op, "operand" => val} end)
+        |> JSON.encode!(),
       "anchor" => Keyword.get(opts, :anchor, "newest"),
       "num_before" => Keyword.get(opts, :num_before, 50),
       "num_after" => Keyword.get(opts, :num_after, 0),
@@ -177,7 +180,8 @@ defmodule ZulipMcp.Client do
            ],
            receive_timeout: 60_000
          ) do
-      {:ok, %Req.Response{status: status, body: %{"result" => "success"} = ok}} when status in 200..299 ->
+      {:ok, %Req.Response{status: status, body: %{"result" => "success"} = ok}}
+      when status in 200..299 ->
         {:ok, ok}
 
       {:ok, %Req.Response{status: status, body: body}} ->
@@ -207,7 +211,8 @@ defmodule ZulipMcp.Client do
     request(:get, "/api/v1/users",
       params: %{
         "client_gravatar" => Keyword.get(opts, :client_gravatar, false) |> to_string(),
-        "include_custom_profile_fields" => Keyword.get(opts, :include_custom_profile_fields, false) |> to_string()
+        "include_custom_profile_fields" =>
+          Keyword.get(opts, :include_custom_profile_fields, false) |> to_string()
       }
     )
   end
@@ -232,24 +237,34 @@ defmodule ZulipMcp.Client do
 
   # --- Private ---
 
+  # Extra attempts on a read timeout, each widening the receive budget. The
+  # global is_mentioned narrow in particular routinely needs more than the 15s
+  # default — returning empty/error on the first timeout is what made agents
+  # silently miss mentions (Guppie msg 597326240).
+  @timeout_retries 2
+
   defp request(method, path, opts) do
     {site, email, api_key} = creds()
     url = site <> path
+    base_timeout = Keyword.get(opts, :receive_timeout, 15_000)
 
-    receive_timeout = Keyword.get(opts, :receive_timeout, 15_000)
-
-    req_opts =
+    build = fn timeout ->
       [
         method: method,
         url: url,
         auth: {:basic, "#{email}:#{api_key}"},
-        receive_timeout: receive_timeout
+        receive_timeout: timeout
       ]
       |> maybe_put(:params, opts[:params])
       |> maybe_put(:form, opts[:form])
       |> maybe_put_method_body(method, opts[:form])
+    end
 
-    case Req.request(req_opts) do
+    run_with_timeout_retry(build, base_timeout, method, 0)
+  end
+
+  defp run_with_timeout_retry(build, timeout, method, attempt) do
+    case Req.request(build.(timeout)) do
       {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
         case body do
           %{"result" => "success"} = ok -> {:ok, ok}
@@ -259,6 +274,11 @@ defmodule ZulipMcp.Client do
 
       {:ok, %Req.Response{status: status, body: body}} ->
         {:error, {:http_error, status, body}}
+
+      # Retry timeouts ONLY for GETs (idempotent). Retrying a write that may
+      # have already landed server-side risks a double-post, so we never do it.
+      {:error, %{reason: :timeout}} when method == :get and attempt < @timeout_retries ->
+        run_with_timeout_retry(build, round(timeout * 1.5), method, attempt + 1)
 
       {:error, reason} ->
         {:error, {:transport_error, reason}}
