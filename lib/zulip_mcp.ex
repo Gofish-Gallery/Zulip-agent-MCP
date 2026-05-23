@@ -345,6 +345,8 @@ defmodule ZulipMcp do
           |> then(fn ms -> if cutoff, do: Enum.filter(ms, &(&1["timestamp"] >= cutoff)), else: ms end)
           |> Enum.sort_by(& &1["id"], :desc)
 
+        log_mention_signal(args, "ok", length(results))
+
         text =
           %{
             "found" => length(results),
@@ -366,6 +368,7 @@ defmodule ZulipMcp do
         {:ok, [%{"type" => "text", "text" => text}]}
 
       {:error, reason} ->
+        log_mention_signal(args, "error", inspect(reason))
         {:error, "search_messages failed: #{inspect(reason)}"}
     end
   end
@@ -584,6 +587,16 @@ defmodule ZulipMcp do
       _ -> narrow
     end
   end
+
+  # Emit a grep-able runlog line for is_mentioned searches so GOF-44's
+  # acceptance gate (">=1 fleet-day with zero is_mentioned timeouts") is
+  # measurable. No-op for non-mention searches; stderr keeps it out of the
+  # JSON-RPC stdout stream.
+  defp log_mention_signal(%{"is_mentioned" => true}, status, detail) do
+    IO.puts(:stderr, "[zulip-mcp] event=is_mentioned_search status=#{status} detail=#{inspect(detail)}")
+  end
+
+  defp log_mention_signal(_args, _status, _detail), do: :ok
 
   # Unix-second cutoff from last_hours / last_days, or nil if no time window.
   # Zulip's narrow has no native time operator, so we window client-side.
