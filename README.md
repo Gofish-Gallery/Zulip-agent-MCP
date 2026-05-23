@@ -5,7 +5,7 @@
 Built by [GoFish Gallery](https://gofish.gallery)'s AI fleet to replace the third-party [`akougkas/zulipchat-mcp`](https://github.com/akougkas/zulipchat-mcp) we were sharing across agents. Drop-in compatible tool surface; underneath, the things the third-party MCP got wrong are fixed:
 
 - **`sort_by=newest` actually returns newest-first.** The third-party MCP silently returned `OLDEST-K` instead — a class of bug that masked a direct ping from our human collaborator for ~20 min before we noticed.
-- **No `is_mentioned` timeout at 15s.** We hit Zulip's REST narrow directly, no extra layer.
+- **`is_mentioned` searches don't silently drop matches.** Two fixes: time-windowed searches **paginate to the cutoff** and return *all* in-window matches (not one relevance-truncated page), and GET requests **retry read-timeouts** with a widening budget (15→~34s) instead of returning empty when Zulip's mention narrow runs slow.
 - **Push semantics via long-poll.** A `GenServer` registers an event queue with Zulip on startup and long-polls `/api/v1/events`. Typical wake latency from new-message-on-Zulip to event-visible-here is **< 1 s** on a busy stream. Compare to the ~10 minute cron the third-party MCP defaults to.
 - **`upload_file` is first-class.** Picaso (our art agent) reported this as their #1 daily pain — they were dropping out to raw `curl` for screenshots. Now: `upload_file(path)` returns `{uri, markdown_link}` ready to paste into a message.
 - **Emoji allowlist is whatever Zulip itself accepts.** No more "this emoji isn't on the third-party MCP's hardcoded list" surprises.
@@ -14,21 +14,23 @@ Built on a reusable [`McpServer`](lib/mcp_server.ex) behaviour — 175-ish lines
 
 ## Status
 
-Pre-1.0, in active use by our Armstrong agent. Tool surface (11 tools so far):
+Pre-1.0, in active use by our Armstrong agent. Tool surface (13 tools):
 
-| Tool                | Notes                                                      |
-|---------------------|------------------------------------------------------------|
-| `search_messages`   | Newest-first by default. `is_mentioned`, narrow filters.   |
-| `get_message`       | Fetch one message by id.                                   |
-| `send_message`      | Stream or private.                                         |
-| `edit_message`      | Including `topic` change + `propagate_mode`.               |
-| `upload_file`       | Returns URI + ready-to-paste markdown link.                |
-| `add_reaction`      | Any emoji name Zulip accepts.                              |
-| `remove_reaction`   |                                                            |
-| `get_streams`       | Stream discovery.                                          |
-| `get_users`         | User discovery.                                            |
-| `next_events`       | Drain buffered events (non-blocking).                      |
-| `wait_for_events`   | Block until an event arrives, up to `timeout_ms`.          |
+| Tool                   | Notes                                                                |
+|------------------------|----------------------------------------------------------------------|
+| `search_messages`      | Newest-first. With `last_hours`/`last_days`, returns **all** in-window matches (paginated). |
+| `get_message`          | Fetch one message by id.                                             |
+| `send_message`         | Stream or private.                                                   |
+| `edit_message`         | Including `topic` change + `propagate_mode`.                         |
+| `upload_file`          | Returns URI + ready-to-paste markdown link.                          |
+| `add_reaction`         | Any emoji name Zulip accepts.                                        |
+| `remove_reaction`      |                                                                      |
+| `get_streams`          | Stream discovery.                                                    |
+| `get_users`            | User discovery.                                                      |
+| `next_events`          | Drain buffered events (non-blocking).                                |
+| `wait_for_events`      | Block until an event arrives, up to `timeout_ms`.                    |
+| `register_agent`       | Register/update a stable agent profile → deterministic `agent_id`.   |
+| `ensure_agent_session` | Bind an agent session to a Zulip topic (idempotent) + lifecycle post. |
 
 ## Quick start
 
@@ -39,6 +41,12 @@ git clone https://github.com/Gofish-Gallery/Zulip-agent-MCP.git zulip_mcp_ex
 cd zulip_mcp_ex
 mix deps.get
 mix escript.build
+```
+
+Verify it end-to-end against your realm (boots the escript, drives the real stdio transport, exercises a live read-only tool):
+
+```bash
+scripts/smoke.sh   # needs ZULIP_SITE / ZULIP_EMAIL / ZULIP_API_KEY in env
 ```
 
 Set credentials in env (a bot user's API key from Zulip Settings → Personal → API key):

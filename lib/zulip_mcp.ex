@@ -21,12 +21,15 @@ defmodule ZulipMcp do
   `anchor=newest` paging) and there's a path for push-mode wakeups via
   `EventsLongPollClient`.
 
-  Tools (first wave, more to come — see `tools/0` below):
+  Tools (13 — see `tools/0` for the authoritative list):
 
-    * `search_messages` — keyword + narrow search, newest-first by
-      default
-    * `get_message` — fetch one message by id
-    * `send_message` — stream or private message
+    * messaging — `search_messages` (newest-first; returns all in-window
+      matches when a time window is given), `get_message`, `send_message`,
+      `edit_message`
+    * reactions/files — `add_reaction`, `remove_reaction`, `upload_file`
+    * discovery — `get_streams`, `get_users`
+    * push-mode events — `next_events`, `wait_for_events`
+    * agent lifecycle — `register_agent`, `ensure_agent_session`
   """
 
   use McpServer
