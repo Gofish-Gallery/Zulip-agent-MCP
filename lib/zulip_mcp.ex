@@ -33,6 +33,12 @@ defmodule ZulipMcp do
 
   alias ZulipMcp.Client
 
+  # search_messages pagination (GOF-42, per Guppie msg 597326240): when a time
+  # window is given we page backwards until we pass the cutoff, so EVERY in-window
+  # match is returned — not just the newest page. Bounded for safety.
+  @search_page_size 100
+  @max_search_pages 25
+
   @impl McpServer
   def server_info, do: %{name: "zulip-mcp-ex", version: "0.1.0"}
 
@@ -248,7 +254,9 @@ defmodule ZulipMcp do
         "Search Zulip messages with filters. Returns newest-first by default — " <>
           "unlike the third-party MCP, sort_by=newest actually works here. " <>
           "Provide any combination of stream, topic, sender, query, is_mentioned, " <>
-          "is_private. Use last_hours / last_days for time window. limit defaults to 50.",
+          "is_private. When last_hours / last_days is set, returns ALL matches in that " <>
+          "window (paginated server-side) so mention sweeps never silently drop older " <>
+          "in-window messages; limit (default 50) applies only when no time window is given.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -312,17 +320,36 @@ defmodule ZulipMcp do
   @impl McpServer
   def handle_tool_call("search_messages", args) do
     narrow = build_narrow(args)
-    num_before = Map.get(args, "limit", 50)
+    cutoff = window_cutoff(args)
 
-    case Client.get_messages(narrow: narrow, anchor: "newest", num_before: num_before) do
-      {:ok, %{"messages" => messages}} ->
-        filtered = messages |> filter_by_time(args) |> Enum.reverse()
+    fetched =
+      case cutoff do
+        nil ->
+          # No time window: a single newest-N fetch (N = limit) is enough.
+          num_before = Map.get(args, "limit", 50)
+
+          with {:ok, %{"messages" => msgs}} <-
+                 Client.get_messages(narrow: narrow, anchor: "newest", num_before: num_before),
+               do: {:ok, msgs}
+
+        cutoff_ts ->
+          # Time window: page backwards until we pass the cutoff so ALL matches
+          # in the window are returned (never relevance/limit-truncated).
+          collect_in_window(narrow, cutoff_ts)
+      end
+
+    case fetched do
+      {:ok, messages} ->
+        results =
+          messages
+          |> then(fn ms -> if cutoff, do: Enum.filter(ms, &(&1["timestamp"] >= cutoff)), else: ms end)
+          |> Enum.sort_by(& &1["id"], :desc)
 
         text =
           %{
-            "found" => length(filtered),
+            "found" => length(results),
             "messages" =>
-              Enum.map(filtered, fn m ->
+              Enum.map(results, fn m ->
                 %{
                   "id" => m["id"],
                   "sender" => m["sender_full_name"],
@@ -558,19 +585,52 @@ defmodule ZulipMcp do
     end
   end
 
-  # Apply last_hours / last_days client-side. Zulip's narrow doesn't have
-  # a native time operator, so we fetch newest-first and trim to the
-  # requested window.
-  defp filter_by_time(messages, args) do
+  # Unix-second cutoff from last_hours / last_days, or nil if no time window.
+  # Zulip's narrow has no native time operator, so we window client-side.
+  defp window_cutoff(args) do
     cond do
-      hours = args["last_hours"] -> cutoff_filter(messages, hours * 3600)
-      days = args["last_days"] -> cutoff_filter(messages, days * 86_400)
-      true -> messages
+      h = args["last_hours"] -> System.system_time(:second) - h * 3600
+      d = args["last_days"] -> System.system_time(:second) - d * 86_400
+      true -> nil
     end
   end
 
-  defp cutoff_filter(messages, seconds) do
-    cutoff = System.system_time(:second) - seconds
-    Enum.filter(messages, &(&1["timestamp"] >= cutoff))
+  # Page backwards from newest until we cross the cutoff (or exhaust the stream
+  # / hit the page cap), accumulating de-duplicated messages. This guarantees
+  # every in-window match is returned even when there's more than one page of
+  # them — the fix for Guppie's lossy-mention-narrow report (msg 597326240).
+  defp collect_in_window(narrow, cutoff) do
+    collect_in_window(narrow, cutoff, "newest", %{}, 0)
+  end
+
+  defp collect_in_window(_narrow, _cutoff, _anchor, acc, page) when page >= @max_search_pages do
+    {:ok, Map.values(acc)}
+  end
+
+  defp collect_in_window(narrow, cutoff, anchor, acc, page) do
+    case Client.get_messages(narrow: narrow, anchor: anchor, num_before: @search_page_size, num_after: 0) do
+      {:ok, %{"messages" => []}} ->
+        {:ok, Map.values(acc)}
+
+      {:ok, %{"messages" => msgs}} ->
+        acc = Enum.reduce(msgs, acc, fn m, a -> Map.put(a, m["id"], m) end)
+        oldest_id = msgs |> Enum.map(& &1["id"]) |> Enum.min()
+        oldest_ts = msgs |> Enum.map(& &1["timestamp"]) |> Enum.min()
+
+        cond do
+          # Fewer than a full page => no older messages remain.
+          length(msgs) < @search_page_size -> {:ok, Map.values(acc)}
+          # Oldest message on this page predates the window => fully covered.
+          oldest_ts < cutoff -> {:ok, Map.values(acc)}
+          # Keep walking older. anchor=oldest_id re-includes that one message
+          # (deduped by the acc map), so we advance page_size-1 per round.
+          true -> collect_in_window(narrow, cutoff, oldest_id, acc, page + 1)
+        end
+
+      {:error, reason} ->
+        # Don't fail the whole search on a later page error — return what we
+        # already gathered; only surface the error if we have nothing at all.
+        if map_size(acc) == 0, do: {:error, reason}, else: {:ok, Map.values(acc)}
+    end
   end
 end
