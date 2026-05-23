@@ -8,6 +8,19 @@ defmodule ZulipMcp.CLI do
 
   def main(_argv) do
     {:ok, _} = Application.ensure_all_started(:req)
+
+    # Start the long-poll client in the background so push-mode events
+    # are buffered for next_events / wait_for_events tool calls. If it
+    # fails (e.g. no Zulip creds), log + continue — the synchronous
+    # tools (search_messages, send_message) still work without it.
+    case ZulipMcp.EventsLongPollClient.start_link([]) do
+      {:ok, _pid} ->
+        IO.puts(:stderr, "[ZulipMcp] EventsLongPollClient up — push mode enabled")
+
+      {:error, reason} ->
+        IO.puts(:stderr, "[ZulipMcp] EventsLongPollClient failed to start: #{inspect(reason)}. Synchronous tools still available.")
+    end
+
     ZulipMcp.serve()
   end
 end

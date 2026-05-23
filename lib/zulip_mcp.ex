@@ -41,8 +41,42 @@ defmodule ZulipMcp do
     [
       tool_search_messages(),
       tool_get_message(),
-      tool_send_message()
+      tool_send_message(),
+      tool_next_events(),
+      tool_wait_for_events()
     ]
+  end
+
+  # --- Tool: next_events (push-mode dequeue) ---
+
+  defp tool_next_events do
+    %{
+      "name" => "next_events",
+      "description" =>
+        "Return any events buffered by the long-poll client since the last call, " <>
+          "and clear the buffer. Non-blocking. Returns [] if no events are queued. " <>
+          "This is the push-mode primitive — typical wake latency from new-message-on-Zulip " <>
+          "to event-visible-here is < 1 s, vs the ~10 min cron poll the third-party MCP uses.",
+      "inputSchema" => %{"type" => "object", "properties" => %{}}
+    }
+  end
+
+  # --- Tool: wait_for_events ---
+
+  defp tool_wait_for_events do
+    %{
+      "name" => "wait_for_events",
+      "description" =>
+        "Block until at least one event arrives, or `timeout_ms` (default 30000) elapses. " <>
+          "Returns the same shape as next_events. Use this when an agent is idle and wants " <>
+          "to wake on the first message without burning a tick to poll.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "timeout_ms" => %{"type" => "integer", "default" => 30_000}
+        }
+      }
+    }
   end
 
   # --- Tool: search_messages ---
@@ -170,6 +204,17 @@ defmodule ZulipMcp do
       {:error, reason} ->
         {:error, "send_message failed: #{inspect(reason)}"}
     end
+  end
+
+  def handle_tool_call("next_events", _args) do
+    events = ZulipMcp.EventsLongPollClient.drain()
+    {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"events" => events, "count" => length(events)})}]}
+  end
+
+  def handle_tool_call("wait_for_events", args) do
+    timeout = Map.get(args, "timeout_ms", 30_000)
+    events = ZulipMcp.EventsLongPollClient.wait(timeout)
+    {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"events" => events, "count" => length(events)})}]}
   end
 
   # Fallback for unknown tool names — clearer error string than letting
