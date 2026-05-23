@@ -119,6 +119,117 @@ defmodule ZulipMcp.Client do
     )
   end
 
+  @doc """
+  Edit a message. Pass `topic` for stream messages if you want to move
+  the message between topics. `propagate_mode` is one of "change_one"
+  (default), "change_later", "change_all".
+  """
+  def update_message(message_id, opts) do
+    body =
+      %{}
+      |> maybe_put_form("content", opts[:content])
+      |> maybe_put_form("topic", opts[:topic])
+      |> maybe_put_form("propagate_mode", opts[:propagate_mode])
+
+    request(:patch, "/api/v1/messages/#{message_id}", form: body)
+  end
+
+  @doc """
+  Add an emoji reaction. `emoji_name` is the Zulip name (no colons),
+  e.g. `"tropical_fish"`.
+  """
+  def add_reaction(message_id, emoji_name) do
+    request(:post, "/api/v1/messages/#{message_id}/reactions",
+      form: %{"emoji_name" => emoji_name}
+    )
+  end
+
+  @doc """
+  Remove an emoji reaction.
+  """
+  def remove_reaction(message_id, emoji_name) do
+    request(:delete, "/api/v1/messages/#{message_id}/reactions",
+      params: %{"emoji_name" => emoji_name}
+    )
+  end
+
+  @doc """
+  Upload a file from disk to Zulip's user_uploads endpoint. Returns
+  `{:ok, %{"uri" => "/user_uploads/...", "url" => "/user_uploads/..."}}`.
+
+  The returned `uri` can be embedded in a message as `[filename](uri)`
+  so the client renders the attachment inline.
+  """
+  def upload_file(path) do
+    filename = Path.basename(path)
+    body = File.read!(path)
+    content_type = mime_type(filename)
+
+    {site, email, api_key} = creds()
+    url = site <> "/api/v1/user_uploads"
+
+    case Req.request(
+           method: :post,
+           url: url,
+           auth: {:basic, "#{email}:#{api_key}"},
+           form_multipart: [
+             {"file", body, [filename: filename, content_type: content_type]}
+           ],
+           receive_timeout: 60_000
+         ) do
+      {:ok, %Req.Response{status: status, body: %{"result" => "success"} = ok}} when status in 200..299 ->
+        {:ok, ok}
+
+      {:ok, %Req.Response{status: status, body: body}} ->
+        {:error, {:http_error, status, body}}
+
+      {:error, reason} ->
+        {:error, {:transport_error, reason}}
+    end
+  end
+
+  @doc """
+  List streams the bot can see. `include_public` defaults to true.
+  """
+  def get_streams(opts \\ []) do
+    request(:get, "/api/v1/streams",
+      params: %{
+        "include_public" => Keyword.get(opts, :include_public, true) |> to_string(),
+        "include_subscribed" => Keyword.get(opts, :include_subscribed, true) |> to_string()
+      }
+    )
+  end
+
+  @doc """
+  Get the user list. By default returns active users only.
+  """
+  def get_users(opts \\ []) do
+    request(:get, "/api/v1/users",
+      params: %{
+        "client_gravatar" => Keyword.get(opts, :client_gravatar, false) |> to_string(),
+        "include_custom_profile_fields" => Keyword.get(opts, :include_custom_profile_fields, false) |> to_string()
+      }
+    )
+  end
+
+  defp maybe_put_form(form, _key, nil), do: form
+  defp maybe_put_form(form, key, value), do: Map.put(form, key, to_string(value))
+
+  defp mime_type(filename) do
+    case Path.extname(filename) |> String.downcase() do
+      ".jpg" -> "image/jpeg"
+      ".jpeg" -> "image/jpeg"
+      ".png" -> "image/png"
+      ".gif" -> "image/gif"
+      ".webp" -> "image/webp"
+      ".pdf" -> "application/pdf"
+      ".txt" -> "text/plain"
+      ".md" -> "text/markdown"
+      ".json" -> "application/json"
+      _ -> "application/octet-stream"
+    end
+  end
+
   # --- Private ---
 
   defp request(method, path, opts) do
@@ -136,6 +247,7 @@ defmodule ZulipMcp.Client do
       ]
       |> maybe_put(:params, opts[:params])
       |> maybe_put(:form, opts[:form])
+      |> maybe_put_method_body(method, opts[:form])
 
     case Req.request(req_opts) do
       {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
@@ -155,6 +267,10 @@ defmodule ZulipMcp.Client do
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  # PATCH/DELETE with body sometimes need form data routed differently
+  # in Req; this is a passthrough placeholder for future tuning.
+  defp maybe_put_method_body(opts, _method, _form), do: opts
 
   defp creds do
     site = System.fetch_env!("ZULIP_SITE") |> String.trim_trailing("/")

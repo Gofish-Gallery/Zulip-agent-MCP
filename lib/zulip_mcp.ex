@@ -42,9 +42,114 @@ defmodule ZulipMcp do
       tool_search_messages(),
       tool_get_message(),
       tool_send_message(),
+      tool_edit_message(),
+      tool_upload_file(),
+      tool_add_reaction(),
+      tool_remove_reaction(),
+      tool_get_streams(),
+      tool_get_users(),
       tool_next_events(),
       tool_wait_for_events()
     ]
+  end
+
+  # --- Tool: edit_message ---
+
+  defp tool_edit_message do
+    %{
+      "name" => "edit_message",
+      "description" =>
+        "Edit a message you've sent. Pass `content` to change the body, `topic` to move " <>
+          "the message between topics (stream messages only). `propagate_mode` is one of " <>
+          "\"change_one\" (default), \"change_later\", \"change_all\".",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "message_id" => %{"type" => "integer"},
+          "content" => %{"type" => "string"},
+          "topic" => %{"type" => "string"},
+          "propagate_mode" => %{"type" => "string", "enum" => ["change_one", "change_later", "change_all"]}
+        },
+        "required" => ["message_id"]
+      }
+    }
+  end
+
+  # --- Tool: upload_file ---
+
+  defp tool_upload_file do
+    %{
+      "name" => "upload_file",
+      "description" =>
+        "Upload a local file to Zulip's user_uploads endpoint. Returns the URI you can " <>
+          "embed in a message as [filename](uri). Picaso's #1 daily pain point on the " <>
+          "third-party MCP — first-class here so screenshots / images / docs don't need " <>
+          "raw curl.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "path" => %{"type" => "string", "description" => "Absolute path on the agent host"}
+        },
+        "required" => ["path"]
+      }
+    }
+  end
+
+  # --- Tool: add_reaction ---
+
+  defp tool_add_reaction do
+    %{
+      "name" => "add_reaction",
+      "description" =>
+        "Add an emoji reaction to a message. `emoji_name` is the Zulip name WITHOUT " <>
+          "surrounding colons (e.g. \"tropical_fish\", not \":tropical_fish:\"). Fixes the " <>
+          "third-party MCP's tiny emoji allowlist — anything Zulip itself accepts works here.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "message_id" => %{"type" => "integer"},
+          "emoji_name" => %{"type" => "string"}
+        },
+        "required" => ["message_id", "emoji_name"]
+      }
+    }
+  end
+
+  # --- Tool: remove_reaction ---
+
+  defp tool_remove_reaction do
+    %{
+      "name" => "remove_reaction",
+      "description" => "Remove an emoji reaction you previously added.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "message_id" => %{"type" => "integer"},
+          "emoji_name" => %{"type" => "string"}
+        },
+        "required" => ["message_id", "emoji_name"]
+      }
+    }
+  end
+
+  # --- Tool: get_streams ---
+
+  defp tool_get_streams do
+    %{
+      "name" => "get_streams",
+      "description" => "List streams the bot can see.",
+      "inputSchema" => %{"type" => "object", "properties" => %{}}
+    }
+  end
+
+  # --- Tool: get_users ---
+
+  defp tool_get_users do
+    %{
+      "name" => "get_users",
+      "description" => "List users in the realm (active by default).",
+      "inputSchema" => %{"type" => "object", "properties" => %{}}
+    }
   end
 
   # --- Tool: next_events (push-mode dequeue) ---
@@ -206,6 +311,82 @@ defmodule ZulipMcp do
     end
   end
 
+  def handle_tool_call("edit_message", %{"message_id" => id} = args) do
+    opts =
+      []
+      |> maybe_kw(:content, args["content"])
+      |> maybe_kw(:topic, args["topic"])
+      |> maybe_kw(:propagate_mode, args["propagate_mode"])
+
+    case Client.update_message(id, opts) do
+      {:ok, _} -> {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"status" => "success"})}]}
+      {:error, reason} -> {:error, "edit_message failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("upload_file", %{"path" => path}) do
+    case Client.upload_file(path) do
+      {:ok, %{"uri" => uri} = resp} ->
+        markdown = "[#{Path.basename(path)}](#{uri})"
+
+        {:ok,
+         [%{"type" => "text", "text" => JSON.encode!(Map.put(resp, "markdown_link", markdown))}]}
+
+      {:error, reason} ->
+        {:error, "upload_file failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("add_reaction", %{"message_id" => id, "emoji_name" => emoji}) do
+    case Client.add_reaction(id, emoji) do
+      {:ok, _} -> {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"status" => "success"})}]}
+      {:error, reason} -> {:error, "add_reaction failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("remove_reaction", %{"message_id" => id, "emoji_name" => emoji}) do
+    case Client.remove_reaction(id, emoji) do
+      {:ok, _} -> {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"status" => "success"})}]}
+      {:error, reason} -> {:error, "remove_reaction failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("get_streams", _args) do
+    case Client.get_streams() do
+      {:ok, %{"streams" => streams}} ->
+        compact =
+          Enum.map(streams, fn s ->
+            %{"id" => s["stream_id"], "name" => s["name"], "description" => s["description"]}
+          end)
+
+        {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"streams" => compact, "count" => length(compact)})}]}
+
+      {:error, reason} ->
+        {:error, "get_streams failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("get_users", _args) do
+    case Client.get_users() do
+      {:ok, %{"members" => members}} ->
+        compact =
+          Enum.map(members, fn m ->
+            %{
+              "user_id" => m["user_id"],
+              "email" => m["email"],
+              "full_name" => m["full_name"],
+              "is_bot" => m["is_bot"],
+              "is_active" => m["is_active"]
+            }
+          end)
+
+        {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"users" => compact, "count" => length(compact)})}]}
+
+      {:error, reason} ->
+        {:error, "get_users failed: #{inspect(reason)}"}
+    end
+  end
+
   def handle_tool_call("next_events", _args) do
     events = ZulipMcp.EventsLongPollClient.drain()
     {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"events" => events, "count" => length(events)})}]}
@@ -222,6 +403,9 @@ defmodule ZulipMcp do
   def handle_tool_call(name, _args) do
     {:error, "Unknown tool: #{name}"}
   end
+
+  defp maybe_kw(kw, _key, nil), do: kw
+  defp maybe_kw(kw, key, value), do: Keyword.put(kw, key, value)
 
   # --- Narrow construction ---
 
