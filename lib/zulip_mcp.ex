@@ -49,8 +49,60 @@ defmodule ZulipMcp do
       tool_get_streams(),
       tool_get_users(),
       tool_next_events(),
-      tool_wait_for_events()
+      tool_wait_for_events(),
+      tool_register_agent(),
+      tool_ensure_agent_session()
     ]
+  end
+
+  # --- Tool: register_agent ---
+
+  defp tool_register_agent do
+    %{
+      "name" => "register_agent",
+      "description" =>
+        "Register or update a stable agent profile for Zulip control. Returns a " <>
+          "deterministic agent_id (idempotent on agent_name/agent_type/owner_email) that " <>
+          "ensure_agent_session consumes. Set stream_name + topic_prefix to control where " <>
+          "this agent's session topics live (default prefix \"Agents/Session\").",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "agent_name" => %{"type" => "string", "default" => "claude"},
+          "agent_type" => %{"type" => "string", "default" => "claude-code"},
+          "owner_email" => %{"type" => "string"},
+          "stream_name" => %{"type" => "string"},
+          "topic_prefix" => %{"type" => "string", "default" => "Agents/Session"},
+          "metadata" => %{"type" => "object"}
+        }
+      }
+    }
+  end
+
+  # --- Tool: ensure_agent_session ---
+
+  defp tool_ensure_agent_session do
+    %{
+      "name" => "ensure_agent_session",
+      "description" =>
+        "Create or refresh the Zulip topic binding for an agent session. Requires an " <>
+          "agent_id from register_agent. Returns a deterministic session_id + the bound " <>
+          "{stream, topic}; idempotent on agent_id + external_session_id. Posts a one-line " <>
+          "lifecycle message into the topic when the session is new or its status changed.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "agent_id" => %{"type" => "string"},
+          "external_session_id" => %{"type" => "string"},
+          "project_name" => %{"type" => "string"},
+          "project_dir" => %{"type" => "string"},
+          "topic_name" => %{"type" => "string"},
+          "status" => %{"type" => "string", "default" => "active"},
+          "metadata" => %{"type" => "object"}
+        },
+        "required" => ["agent_id"]
+      }
+    }
   end
 
   # --- Tool: edit_message ---
@@ -68,7 +120,10 @@ defmodule ZulipMcp do
           "message_id" => %{"type" => "integer"},
           "content" => %{"type" => "string"},
           "topic" => %{"type" => "string"},
-          "propagate_mode" => %{"type" => "string", "enum" => ["change_one", "change_later", "change_all"]}
+          "propagate_mode" => %{
+            "type" => "string",
+            "enum" => ["change_one", "change_later", "change_all"]
+          }
         },
         "required" => ["message_id"]
       }
@@ -304,7 +359,13 @@ defmodule ZulipMcp do
 
     case Client.send_message(type, to, topic, content) do
       {:ok, %{"id" => msg_id}} ->
-        {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"status" => "success", "message_id" => msg_id})}]}
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(%{"status" => "success", "message_id" => msg_id})
+           }
+         ]}
 
       {:error, reason} ->
         {:error, "send_message failed: #{inspect(reason)}"}
@@ -359,7 +420,13 @@ defmodule ZulipMcp do
             %{"id" => s["stream_id"], "name" => s["name"], "description" => s["description"]}
           end)
 
-        {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"streams" => compact, "count" => length(compact)})}]}
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(%{"streams" => compact, "count" => length(compact)})
+           }
+         ]}
 
       {:error, reason} ->
         {:error, "get_streams failed: #{inspect(reason)}"}
@@ -380,7 +447,13 @@ defmodule ZulipMcp do
             }
           end)
 
-        {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"users" => compact, "count" => length(compact)})}]}
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(%{"users" => compact, "count" => length(compact)})
+           }
+         ]}
 
       {:error, reason} ->
         {:error, "get_users failed: #{inspect(reason)}"}
@@ -389,13 +462,65 @@ defmodule ZulipMcp do
 
   def handle_tool_call("next_events", _args) do
     events = ZulipMcp.EventsLongPollClient.drain()
-    {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"events" => events, "count" => length(events)})}]}
+
+    {:ok,
+     [
+       %{
+         "type" => "text",
+         "text" => JSON.encode!(%{"events" => events, "count" => length(events)})
+       }
+     ]}
   end
 
   def handle_tool_call("wait_for_events", args) do
     timeout = Map.get(args, "timeout_ms", 30_000)
     events = ZulipMcp.EventsLongPollClient.wait(timeout)
-    {:ok, [%{"type" => "text", "text" => JSON.encode!(%{"events" => events, "count" => length(events)})}]}
+
+    {:ok,
+     [
+       %{
+         "type" => "text",
+         "text" => JSON.encode!(%{"events" => events, "count" => length(events)})
+       }
+     ]}
+  end
+
+  def handle_tool_call("register_agent", args) do
+    case ZulipMcp.AgentRegistry.register(args) do
+      {:ok, profile} ->
+        {:ok, [%{"type" => "text", "text" => JSON.encode!(profile)}]}
+
+      {:error, reason} ->
+        {:error, "register_agent failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("ensure_agent_session", %{"agent_id" => _} = args) do
+    case ZulipMcp.AgentRegistry.ensure_session(args) do
+      {:ok, session, change} ->
+        # Shell side effect: announce the session in its topic, but only when
+        # it's new or its status changed, so refresh calls don't spam.
+        if change == :new do
+          _ =
+            Client.send_message(
+              "stream",
+              session["stream"],
+              session["topic"],
+              "🟢 `#{session["agent_name"]}` session **#{session["status"]}** (session_id `#{session["session_id"]}`)"
+            )
+        end
+
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(Map.put(session, "lifecycle_posted", change == :new))
+           }
+         ]}
+
+      {:error, :unknown_agent} ->
+        {:error, "ensure_agent_session failed: unknown agent_id — call register_agent first"}
+    end
   end
 
   # Fallback for unknown tool names — clearer error string than letting
