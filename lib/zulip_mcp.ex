@@ -486,13 +486,8 @@ defmodule ZulipMcp do
   end
 
   def handle_tool_call("register_agent", args) do
-    case ZulipMcp.AgentRegistry.register(args) do
-      {:ok, profile} ->
-        {:ok, [%{"type" => "text", "text" => JSON.encode!(profile)}]}
-
-      {:error, reason} ->
-        {:error, "register_agent failed: #{inspect(reason)}"}
-    end
+    {:ok, profile} = ZulipMcp.AgentRegistry.register(args)
+    {:ok, [%{"type" => "text", "text" => JSON.encode!(profile)}]}
   end
 
   def handle_tool_call("ensure_agent_session", %{"agent_id" => _} = args) do
