@@ -176,7 +176,7 @@ defmodule ZulipMcp.Client do
            url: url,
            auth: {:basic, "#{email}:#{api_key}"},
            form_multipart: [
-             {"file", body, [filename: filename, content_type: content_type]}
+             {"file", {body, filename: filename, content_type: content_type}}
            ],
            receive_timeout: 60_000
          ) do
