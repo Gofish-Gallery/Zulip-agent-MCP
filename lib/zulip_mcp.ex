@@ -397,14 +397,21 @@ defmodule ZulipMcp do
   defp tool_send_message do
     %{
       "name" => "send_message",
-      "description" => "Send a stream or private message.",
+      "description" =>
+        "Send a stream or private message. Optionally attach a local file via `file` " <>
+          "(absolute path) — it's uploaded and embedded inline in one call (no separate " <>
+          "upload_file step needed).",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "type" => %{"type" => "string", "enum" => ["stream", "private"]},
           "to" => %{"type" => "string"},
           "topic" => %{"type" => "string"},
-          "content" => %{"type" => "string"}
+          "content" => %{"type" => "string"},
+          "file" => %{
+            "type" => "string",
+            "description" => "Optional: absolute path to a local file to upload + embed inline"
+          }
         },
         "required" => ["type", "to", "content"]
       }
@@ -487,18 +494,17 @@ defmodule ZulipMcp do
   def handle_tool_call("send_message", %{"type" => type, "to" => to, "content" => content} = args) do
     topic = Map.get(args, "topic")
 
-    case Client.send_message(type, to, topic, content) do
-      {:ok, %{"id" => msg_id}} ->
-        {:ok,
-         [
-           %{
-             "type" => "text",
-             "text" => JSON.encode!(%{"status" => "success", "message_id" => msg_id})
-           }
-         ]}
-
-      {:error, reason} ->
-        {:error, "send_message failed: #{inspect(reason)}"}
+    with {:ok, full_content} <- maybe_attach_file(content, args["file"]),
+         {:ok, %{"id" => msg_id}} <- Client.send_message(type, to, topic, full_content) do
+      {:ok,
+       [
+         %{
+           "type" => "text",
+           "text" => JSON.encode!(%{"status" => "success", "message_id" => msg_id})
+         }
+       ]}
+    else
+      {:error, reason} -> {:error, "send_message failed: #{inspect(reason)}"}
     end
   end
 
@@ -644,6 +650,9 @@ defmodule ZulipMcp do
             %{
               "id" => m["id"],
               "sender" => m["sender_full_name"],
+              # sender_email so agents can gate on it (e.g. only act on Luke
+              # directives when email == curator@gofish.gallery) — Picaso 597554626.
+              "email" => m["sender_email"],
               "stream" => m["display_recipient"],
               "topic" => m["subject"],
               "timestamp" => m["timestamp"],
@@ -773,6 +782,23 @@ defmodule ZulipMcp do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Optionally upload a local file and append an inline embed to the message
+  # content — collapses the old upload-then-embed 2-step into one send_message
+  # call (path-based, per Picaso 597554626). No file → content unchanged.
+  defp maybe_attach_file(content, nil), do: {:ok, content}
+  defp maybe_attach_file(content, ""), do: {:ok, content}
+
+  defp maybe_attach_file(content, path) when is_binary(path) do
+    case Client.upload_file(path) do
+      {:ok, %{"uri" => uri}} ->
+        embed = "[#{Path.basename(path)}](#{uri})"
+        {:ok, if(content in [nil, ""], do: embed, else: content <> "\n\n" <> embed)}
+
+      {:error, reason} ->
+        {:error, {:upload_failed, reason}}
     end
   end
 
