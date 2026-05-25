@@ -60,7 +60,10 @@ defmodule ZulipMcp do
       tool_next_events(),
       tool_wait_for_events(),
       tool_register_agent(),
-      tool_ensure_agent_session()
+      tool_ensure_agent_session(),
+      tool_list_followed_topics(),
+      tool_follow_topic(),
+      tool_unfollow_topic()
     ]
   end
 
@@ -213,6 +216,54 @@ defmodule ZulipMcp do
       "name" => "get_users",
       "description" => "List users in the realm (active by default).",
       "inputSchema" => %{"type" => "object", "properties" => %{}}
+    }
+  end
+
+  # --- Tool: followed-topic subscriptions (GOF-73) ---
+
+  defp tool_list_followed_topics do
+    %{
+      "name" => "list_followed_topics",
+      "description" =>
+        "List the topics this bot follows (Zulip user_topics, visibility_policy=followed). " <>
+          "This is the bot's durable, Zulip-managed subscription list — pair it with catch_up " <>
+          "to read new messages without time-window sweeps.",
+      "inputSchema" => %{"type" => "object", "properties" => %{}}
+    }
+  end
+
+  defp tool_follow_topic do
+    %{
+      "name" => "follow_topic",
+      "description" =>
+        "Follow a stream topic so it shows in list_followed_topics (and, later, catch_up). " <>
+          "Idempotent.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "stream" => %{
+            "type" => "string",
+            "description" => "Stream name (resolved to stream_id internally)"
+          },
+          "topic" => %{"type" => "string", "description" => "Topic name"}
+        },
+        "required" => ["stream", "topic"]
+      }
+    }
+  end
+
+  defp tool_unfollow_topic do
+    %{
+      "name" => "unfollow_topic",
+      "description" => "Stop following a stream topic. Idempotent.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "stream" => %{"type" => "string", "description" => "Stream name"},
+          "topic" => %{"type" => "string", "description" => "Topic name"}
+        },
+        "required" => ["stream", "topic"]
+      }
     }
   end
 
@@ -493,6 +544,35 @@ defmodule ZulipMcp do
     end
   end
 
+  # --- Followed-topic subscriptions (GOF-73) ---
+
+  def handle_tool_call("list_followed_topics", _args) do
+    case Client.get_user_topics() do
+      {:ok, %{"user_topics" => topics}} ->
+        followed =
+          topics
+          |> Enum.filter(fn t -> t["visibility_policy"] == 3 end)
+          |> Enum.map(fn t -> %{"stream_id" => t["stream_id"], "topic" => t["topic_name"]} end)
+
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(%{"followed_topics" => followed, "count" => length(followed)})
+           }
+         ]}
+
+      {:error, reason} ->
+        {:error, "list_followed_topics failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("follow_topic", %{"stream" => stream, "topic" => topic}),
+    do: set_topic_follow(stream, topic, 3, "follow_topic")
+
+  def handle_tool_call("unfollow_topic", %{"stream" => stream, "topic" => topic}),
+    do: set_topic_follow(stream, topic, 0, "unfollow_topic")
+
   def handle_tool_call("next_events", _args) do
     events = ZulipMcp.EventsLongPollClient.drain()
 
@@ -555,6 +635,43 @@ defmodule ZulipMcp do
   # FunctionClauseError bubble up to McpServer's rescue block.
   def handle_tool_call(name, _args) do
     {:error, "Unknown tool: #{name}"}
+  end
+
+  # --- Followed-topic helpers (GOF-73) ---
+
+  defp set_topic_follow(stream, topic, policy, tool) do
+    with {:ok, stream_id} <- resolve_stream_id(stream),
+         {:ok, _resp} <- Client.set_topic_visibility(stream_id, topic, policy) do
+      {:ok,
+       [
+         %{
+           "type" => "text",
+           "text" =>
+             JSON.encode!(%{
+               "ok" => true,
+               "stream" => stream,
+               "topic" => topic,
+               "visibility_policy" => policy
+             })
+         }
+       ]}
+    else
+      {:error, reason} -> {:error, "#{tool} failed: #{inspect(reason)}"}
+    end
+  end
+
+  # Agents work in stream *names*; user_topics needs the numeric stream_id.
+  defp resolve_stream_id(stream_name) do
+    case Client.get_streams() do
+      {:ok, %{"streams" => streams}} ->
+        case Enum.find(streams, fn s -> s["name"] == stream_name end) do
+          nil -> {:error, "unknown stream: #{stream_name}"}
+          s -> {:ok, s["stream_id"]}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp maybe_kw(kw, _key, nil), do: kw
