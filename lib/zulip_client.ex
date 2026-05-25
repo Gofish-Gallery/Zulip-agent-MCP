@@ -259,6 +259,21 @@ defmodule ZulipMcp.Client do
     )
   end
 
+  @doc """
+  Mark messages read by id via POST /api/v1/messages/flags (op=add, flag=read).
+  Explicit cursor-advance for catch_up — only clears what the caller actually
+  processed, so a partial batch never silently drops the rest.
+  """
+  def mark_messages_read(message_ids) when is_list(message_ids) do
+    request(:post, "/api/v1/messages/flags",
+      form: %{
+        "messages" => JSON.encode!(message_ids),
+        "op" => "add",
+        "flag" => "read"
+      }
+    )
+  end
+
   defp maybe_put_form(form, _key, nil), do: form
   defp maybe_put_form(form, key, value), do: Map.put(form, key, to_string(value))
 

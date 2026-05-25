@@ -63,7 +63,9 @@ defmodule ZulipMcp do
       tool_ensure_agent_session(),
       tool_list_followed_topics(),
       tool_follow_topic(),
-      tool_unfollow_topic()
+      tool_unfollow_topic(),
+      tool_catch_up(),
+      tool_mark_read()
     ]
   end
 
@@ -263,6 +265,50 @@ defmodule ZulipMcp do
           "topic" => %{"type" => "string", "description" => "Topic name"}
         },
         "required" => ["stream", "topic"]
+      }
+    }
+  end
+
+  # --- Tool: catch_up / mark_read (read-cursor; GOF-73) ---
+
+  defp tool_catch_up do
+    %{
+      "name" => "catch_up",
+      "description" =>
+        "Return unread messages in your followed topics, oldest-first — the kill-the-sweep " <>
+          "primitive. Backed by Zulip read-state (no time windows, no client-side last_id). " <>
+          "Optionally scope to one stream (and topic). Returns up to `limit` (default 30) full " <>
+          "messages; then call mark_read with the ids you actually processed to advance the cursor.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "stream" => %{"type" => "string", "description" => "Optional: scope to this stream"},
+          "topic" => %{
+            "type" => "string",
+            "description" => "Optional: scope to this topic (requires stream)"
+          },
+          "limit" => %{"type" => "integer", "description" => "Max messages to return (default 30)"}
+        }
+      }
+    }
+  end
+
+  defp tool_mark_read do
+    %{
+      "name" => "mark_read",
+      "description" =>
+        "Mark messages read by id, advancing the catch_up cursor. Explicit — only clears the " <>
+          "ids you pass, so a partially-processed batch leaves the rest unread for next tick.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "message_ids" => %{
+            "type" => "array",
+            "items" => %{"type" => "integer"},
+            "description" => "Message ids to mark read"
+          }
+        },
+        "required" => ["message_ids"]
       }
     }
   end
@@ -572,6 +618,62 @@ defmodule ZulipMcp do
 
   def handle_tool_call("unfollow_topic", %{"stream" => stream, "topic" => topic}),
     do: set_topic_follow(stream, topic, 0, "unfollow_topic")
+
+  def handle_tool_call("catch_up", args) do
+    limit = Map.get(args, "limit", 30)
+
+    # is:unread scopes to read-state (the cursor). Scope to an explicit
+    # stream/topic if given, else to all followed topics (is:followed).
+    narrow =
+      cond do
+        args["stream"] && args["topic"] ->
+          [{"is", "unread"}, {"stream", args["stream"]}, {"topic", args["topic"]}]
+
+        args["stream"] ->
+          [{"is", "unread"}, {"stream", args["stream"]}]
+
+        true ->
+          [{"is", "unread"}, {"is", "followed"}]
+      end
+
+    # anchor=oldest + num_after returns the oldest unread first (process in order).
+    case Client.get_messages(narrow: narrow, anchor: "oldest", num_before: 0, num_after: limit) do
+      {:ok, %{"messages" => messages}} ->
+        compact =
+          Enum.map(messages, fn m ->
+            %{
+              "id" => m["id"],
+              "sender" => m["sender_full_name"],
+              "stream" => m["display_recipient"],
+              "topic" => m["subject"],
+              "timestamp" => m["timestamp"],
+              "content" => m["content"]
+            }
+          end)
+
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(%{"messages" => compact, "count" => length(compact)})
+           }
+         ]}
+
+      {:error, reason} ->
+        {:error, "catch_up failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("mark_read", %{"message_ids" => ids}) when is_list(ids) do
+    case Client.mark_messages_read(ids) do
+      {:ok, _resp} ->
+        {:ok,
+         [%{"type" => "text", "text" => JSON.encode!(%{"ok" => true, "marked_read" => length(ids)})}]}
+
+      {:error, reason} ->
+        {:error, "mark_read failed: #{inspect(reason)}"}
+    end
+  end
 
   def handle_tool_call("next_events", _args) do
     events = ZulipMcp.EventsLongPollClient.drain()
