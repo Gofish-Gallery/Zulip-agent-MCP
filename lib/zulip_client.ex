@@ -217,6 +217,63 @@ defmodule ZulipMcp.Client do
     )
   end
 
+  # --- Topic subscriptions / followed topics (GOF-73) ---
+  # Zulip models "subscribe to a topic" as a user_topic visibility_policy.
+  # Values: 0 = inherit/none, 1 = muted, 2 = unmuted, 3 = followed.
+  # NB: exact request/response shapes verified against Zulip's REST API docs;
+  # Boblak's QA pass confirms live behaviour end-to-end.
+
+  @visibility_followed 3
+  @visibility_none 0
+
+  @doc """
+  Set a (stream_id, topic) visibility policy via POST /api/v1/user_topics.
+  Idempotent server-side. `policy` is one of the visibility_policy ints above.
+  """
+  def set_topic_visibility(stream_id, topic, policy)
+      when is_integer(stream_id) and is_binary(topic) and is_integer(policy) do
+    request(:post, "/api/v1/user_topics",
+      form: %{
+        "stream_id" => stream_id,
+        "topic" => topic,
+        "visibility_policy" => policy
+      }
+    )
+  end
+
+  @doc "Follow a topic (visibility_policy = followed)."
+  def follow_topic(stream_id, topic), do: set_topic_visibility(stream_id, topic, @visibility_followed)
+
+  @doc "Stop following a topic (visibility_policy = inherit/none)."
+  def unfollow_topic(stream_id, topic), do: set_topic_visibility(stream_id, topic, @visibility_none)
+
+  @doc """
+  Fetch the bot's user_topics state. Zulip has no dedicated GET list endpoint —
+  the followed set lives in the `/register` snapshot — so we request only the
+  user_topic state (no long-lived event queue). Returns the raw `user_topics`
+  list; the caller filters by visibility_policy (3 = followed).
+  """
+  def get_user_topics do
+    request(:post, "/api/v1/register",
+      form: %{"fetch_event_types" => JSON.encode!(["user_topic"])}
+    )
+  end
+
+  @doc """
+  Mark messages read by id via POST /api/v1/messages/flags (op=add, flag=read).
+  Explicit cursor-advance for catch_up — only clears what the caller actually
+  processed, so a partial batch never silently drops the rest.
+  """
+  def mark_messages_read(message_ids) when is_list(message_ids) do
+    request(:post, "/api/v1/messages/flags",
+      form: %{
+        "messages" => JSON.encode!(message_ids),
+        "op" => "add",
+        "flag" => "read"
+      }
+    )
+  end
+
   defp maybe_put_form(form, _key, nil), do: form
   defp maybe_put_form(form, key, value), do: Map.put(form, key, to_string(value))
 

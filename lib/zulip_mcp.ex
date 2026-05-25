@@ -60,7 +60,12 @@ defmodule ZulipMcp do
       tool_next_events(),
       tool_wait_for_events(),
       tool_register_agent(),
-      tool_ensure_agent_session()
+      tool_ensure_agent_session(),
+      tool_list_followed_topics(),
+      tool_follow_topic(),
+      tool_unfollow_topic(),
+      tool_catch_up(),
+      tool_mark_read()
     ]
   end
 
@@ -216,6 +221,98 @@ defmodule ZulipMcp do
     }
   end
 
+  # --- Tool: followed-topic subscriptions (GOF-73) ---
+
+  defp tool_list_followed_topics do
+    %{
+      "name" => "list_followed_topics",
+      "description" =>
+        "List the topics this bot follows (Zulip user_topics, visibility_policy=followed). " <>
+          "This is the bot's durable, Zulip-managed subscription list — pair it with catch_up " <>
+          "to read new messages without time-window sweeps.",
+      "inputSchema" => %{"type" => "object", "properties" => %{}}
+    }
+  end
+
+  defp tool_follow_topic do
+    %{
+      "name" => "follow_topic",
+      "description" =>
+        "Follow a stream topic so it shows in list_followed_topics (and, later, catch_up). " <>
+          "Idempotent.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "stream" => %{
+            "type" => "string",
+            "description" => "Stream name (resolved to stream_id internally)"
+          },
+          "topic" => %{"type" => "string", "description" => "Topic name"}
+        },
+        "required" => ["stream", "topic"]
+      }
+    }
+  end
+
+  defp tool_unfollow_topic do
+    %{
+      "name" => "unfollow_topic",
+      "description" => "Stop following a stream topic. Idempotent.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "stream" => %{"type" => "string", "description" => "Stream name"},
+          "topic" => %{"type" => "string", "description" => "Topic name"}
+        },
+        "required" => ["stream", "topic"]
+      }
+    }
+  end
+
+  # --- Tool: catch_up / mark_read (read-cursor; GOF-73) ---
+
+  defp tool_catch_up do
+    %{
+      "name" => "catch_up",
+      "description" =>
+        "Return unread messages in your followed topics, oldest-first — the kill-the-sweep " <>
+          "primitive. Backed by Zulip read-state (no time windows, no client-side last_id). " <>
+          "Optionally scope to one stream (and topic). Returns up to `limit` (default 30) full " <>
+          "messages; then call mark_read with the ids you actually processed to advance the cursor.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "stream" => %{"type" => "string", "description" => "Optional: scope to this stream"},
+          "topic" => %{
+            "type" => "string",
+            "description" => "Optional: scope to this topic (requires stream)"
+          },
+          "limit" => %{"type" => "integer", "description" => "Max messages to return (default 30)"}
+        }
+      }
+    }
+  end
+
+  defp tool_mark_read do
+    %{
+      "name" => "mark_read",
+      "description" =>
+        "Mark messages read by id, advancing the catch_up cursor. Explicit — only clears the " <>
+          "ids you pass, so a partially-processed batch leaves the rest unread for next tick.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "message_ids" => %{
+            "type" => "array",
+            "items" => %{"type" => "integer"},
+            "description" => "Message ids to mark read"
+          }
+        },
+        "required" => ["message_ids"]
+      }
+    }
+  end
+
   # --- Tool: next_events (push-mode dequeue) ---
 
   defp tool_next_events do
@@ -300,14 +397,21 @@ defmodule ZulipMcp do
   defp tool_send_message do
     %{
       "name" => "send_message",
-      "description" => "Send a stream or private message.",
+      "description" =>
+        "Send a stream or private message. Optionally attach a local file via `file` " <>
+          "(absolute path) — it's uploaded and embedded inline in one call (no separate " <>
+          "upload_file step needed).",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "type" => %{"type" => "string", "enum" => ["stream", "private"]},
           "to" => %{"type" => "string"},
           "topic" => %{"type" => "string"},
-          "content" => %{"type" => "string"}
+          "content" => %{"type" => "string"},
+          "file" => %{
+            "type" => "string",
+            "description" => "Optional: absolute path to a local file to upload + embed inline"
+          }
         },
         "required" => ["type", "to", "content"]
       }
@@ -390,18 +494,17 @@ defmodule ZulipMcp do
   def handle_tool_call("send_message", %{"type" => type, "to" => to, "content" => content} = args) do
     topic = Map.get(args, "topic")
 
-    case Client.send_message(type, to, topic, content) do
-      {:ok, %{"id" => msg_id}} ->
-        {:ok,
-         [
-           %{
-             "type" => "text",
-             "text" => JSON.encode!(%{"status" => "success", "message_id" => msg_id})
-           }
-         ]}
-
-      {:error, reason} ->
-        {:error, "send_message failed: #{inspect(reason)}"}
+    with {:ok, full_content} <- maybe_attach_file(content, args["file"]),
+         {:ok, %{"id" => msg_id}} <- Client.send_message(type, to, topic, full_content) do
+      {:ok,
+       [
+         %{
+           "type" => "text",
+           "text" => JSON.encode!(%{"status" => "success", "message_id" => msg_id})
+         }
+       ]}
+    else
+      {:error, reason} -> {:error, "send_message failed: #{inspect(reason)}"}
     end
   end
 
@@ -493,6 +596,94 @@ defmodule ZulipMcp do
     end
   end
 
+  # --- Followed-topic subscriptions (GOF-73) ---
+
+  def handle_tool_call("list_followed_topics", _args) do
+    case Client.get_user_topics() do
+      {:ok, %{"user_topics" => topics}} ->
+        followed =
+          topics
+          |> Enum.filter(fn t -> t["visibility_policy"] == 3 end)
+          |> Enum.map(fn t -> %{"stream_id" => t["stream_id"], "topic" => t["topic_name"]} end)
+
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(%{"followed_topics" => followed, "count" => length(followed)})
+           }
+         ]}
+
+      {:error, reason} ->
+        {:error, "list_followed_topics failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("follow_topic", %{"stream" => stream, "topic" => topic}),
+    do: set_topic_follow(stream, topic, 3, "follow_topic")
+
+  def handle_tool_call("unfollow_topic", %{"stream" => stream, "topic" => topic}),
+    do: set_topic_follow(stream, topic, 0, "unfollow_topic")
+
+  def handle_tool_call("catch_up", args) do
+    limit = Map.get(args, "limit", 30)
+
+    # is:unread scopes to read-state (the cursor). Scope to an explicit
+    # stream/topic if given, else to all followed topics (is:followed).
+    narrow =
+      cond do
+        args["stream"] && args["topic"] ->
+          [{"is", "unread"}, {"stream", args["stream"]}, {"topic", args["topic"]}]
+
+        args["stream"] ->
+          [{"is", "unread"}, {"stream", args["stream"]}]
+
+        true ->
+          [{"is", "unread"}, {"is", "followed"}]
+      end
+
+    # anchor=oldest + num_after returns the oldest unread first (process in order).
+    case Client.get_messages(narrow: narrow, anchor: "oldest", num_before: 0, num_after: limit) do
+      {:ok, %{"messages" => messages}} ->
+        compact =
+          Enum.map(messages, fn m ->
+            %{
+              "id" => m["id"],
+              "sender" => m["sender_full_name"],
+              # sender_email so agents can gate on it (e.g. only act on Luke
+              # directives when email == curator@gofish.gallery) — Picaso 597554626.
+              "email" => m["sender_email"],
+              "stream" => m["display_recipient"],
+              "topic" => m["subject"],
+              "timestamp" => m["timestamp"],
+              "content" => m["content"]
+            }
+          end)
+
+        {:ok,
+         [
+           %{
+             "type" => "text",
+             "text" => JSON.encode!(%{"messages" => compact, "count" => length(compact)})
+           }
+         ]}
+
+      {:error, reason} ->
+        {:error, "catch_up failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle_tool_call("mark_read", %{"message_ids" => ids}) when is_list(ids) do
+    case Client.mark_messages_read(ids) do
+      {:ok, _resp} ->
+        {:ok,
+         [%{"type" => "text", "text" => JSON.encode!(%{"ok" => true, "marked_read" => length(ids)})}]}
+
+      {:error, reason} ->
+        {:error, "mark_read failed: #{inspect(reason)}"}
+    end
+  end
+
   def handle_tool_call("next_events", _args) do
     events = ZulipMcp.EventsLongPollClient.drain()
 
@@ -555,6 +746,60 @@ defmodule ZulipMcp do
   # FunctionClauseError bubble up to McpServer's rescue block.
   def handle_tool_call(name, _args) do
     {:error, "Unknown tool: #{name}"}
+  end
+
+  # --- Followed-topic helpers (GOF-73) ---
+
+  defp set_topic_follow(stream, topic, policy, tool) do
+    with {:ok, stream_id} <- resolve_stream_id(stream),
+         {:ok, _resp} <- Client.set_topic_visibility(stream_id, topic, policy) do
+      {:ok,
+       [
+         %{
+           "type" => "text",
+           "text" =>
+             JSON.encode!(%{
+               "ok" => true,
+               "stream" => stream,
+               "topic" => topic,
+               "visibility_policy" => policy
+             })
+         }
+       ]}
+    else
+      {:error, reason} -> {:error, "#{tool} failed: #{inspect(reason)}"}
+    end
+  end
+
+  # Agents work in stream *names*; user_topics needs the numeric stream_id.
+  defp resolve_stream_id(stream_name) do
+    case Client.get_streams() do
+      {:ok, %{"streams" => streams}} ->
+        case Enum.find(streams, fn s -> s["name"] == stream_name end) do
+          nil -> {:error, "unknown stream: #{stream_name}"}
+          s -> {:ok, s["stream_id"]}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Optionally upload a local file and append an inline embed to the message
+  # content — collapses the old upload-then-embed 2-step into one send_message
+  # call (path-based, per Picaso 597554626). No file → content unchanged.
+  defp maybe_attach_file(content, nil), do: {:ok, content}
+  defp maybe_attach_file(content, ""), do: {:ok, content}
+
+  defp maybe_attach_file(content, path) when is_binary(path) do
+    case Client.upload_file(path) do
+      {:ok, %{"uri" => uri}} ->
+        embed = "[#{Path.basename(path)}](#{uri})"
+        {:ok, if(content in [nil, ""], do: embed, else: content <> "\n\n" <> embed)}
+
+      {:error, reason} ->
+        {:error, {:upload_failed, reason}}
+    end
   end
 
   defp maybe_kw(kw, _key, nil), do: kw
