@@ -10,6 +10,16 @@ defmodule ZulipMcpTest do
     assert Enum.all?(ZulipMcp.tools(), &match?(%{"inputSchema" => %{"type" => "object"}}, &1))
   end
 
+  test "get_streams advertises include_topics + name_contains (the topic-discovery path)" do
+    schema =
+      ZulipMcp.tools()
+      |> Enum.find(&(&1["name"] == "get_streams"))
+      |> get_in(["inputSchema", "properties"])
+
+    assert %{"type" => "boolean"} = schema["include_topics"]
+    assert %{"type" => "string"} = schema["name_contains"]
+  end
+
   test "unknown tool returns a clear error" do
     assert {:error, "Unknown tool: nope"} = ZulipMcp.handle_tool_call("nope", %{})
   end
