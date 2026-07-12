@@ -206,8 +206,25 @@ defmodule ZulipMcp do
   defp tool_get_streams do
     %{
       "name" => "get_streams",
-      "description" => "List streams the bot can see.",
-      "inputSchema" => %{"type" => "object", "properties" => %{}}
+      "description" =>
+        "List streams the bot can see. Set include_topics to also return each stream's " <>
+          "recent topic names (one extra API call per stream — pair with name_contains to " <>
+          "scope it). This is the topic-discovery path, e.g. finding the new " <>
+          "\"Cycle N - dev chat\" topic on a cycle roll.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "include_topics" => %{
+            "type" => "boolean",
+            "description" => "Also return recent topic names per stream (default false)"
+          },
+          "name_contains" => %{
+            "type" => "string",
+            "description" =>
+              "Optional: only return streams whose name contains this (case-insensitive)"
+          }
+        }
+      }
     }
   end
 
@@ -548,12 +565,28 @@ defmodule ZulipMcp do
     end
   end
 
-  def handle_tool_call("get_streams", _args) do
+  def handle_tool_call("get_streams", args) do
     case Client.get_streams() do
       {:ok, %{"streams" => streams}} ->
+        streams =
+          case args["name_contains"] do
+            filter when is_binary(filter) and filter != "" ->
+              down = String.downcase(filter)
+              Enum.filter(streams, &String.contains?(String.downcase(&1["name"]), down))
+
+            _ ->
+              streams
+          end
+
         compact =
           Enum.map(streams, fn s ->
-            %{"id" => s["stream_id"], "name" => s["name"], "description" => s["description"]}
+            base = %{"id" => s["stream_id"], "name" => s["name"], "description" => s["description"]}
+
+            if args["include_topics"] == true do
+              Map.put(base, "topics", stream_topic_names(s["stream_id"]))
+            else
+              base
+            end
           end)
 
         {:ok,
@@ -566,6 +599,17 @@ defmodule ZulipMcp do
 
       {:error, reason} ->
         {:error, "get_streams failed: #{inspect(reason)}"}
+    end
+  end
+
+  # Per-stream topic fetch is best-effort: this is a remote-API boundary (the
+  # one place fallbacks are allowed), and a permissions edge on one stream
+  # shouldn't fail a 26-stream discovery listing. An error yields [] for that
+  # stream only.
+  defp stream_topic_names(stream_id) do
+    case Client.get_stream_topics(stream_id) do
+      {:ok, %{"topics" => topics}} -> Enum.map(topics, & &1["name"])
+      {:error, _reason} -> []
     end
   end
 

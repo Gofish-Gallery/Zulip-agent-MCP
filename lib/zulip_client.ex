@@ -205,6 +205,14 @@ defmodule ZulipMcp.Client do
   end
 
   @doc """
+  Recent topics in a stream, newest-first (Zulip returns them ordered by
+  max_id descending). GET /api/v1/users/me/{stream_id}/topics.
+  """
+  def get_stream_topics(stream_id) do
+    request(:get, "/api/v1/users/me/#{stream_id}/topics", params: %{})
+  end
+
+  @doc """
   Get the user list. By default returns active users only.
   """
   def get_users(opts \\ []) do
